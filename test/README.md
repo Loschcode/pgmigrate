@@ -9,7 +9,7 @@ Unit tests live beside the package under test as `*_test.go` and do not require
 PostgreSQL. They cover pure logic and controlled I/O, including filters,
 fingerprints, phase transitions, TOC classification, COPY planning and retry
 classification, pgoutput decoding, transaction codecs, segment recovery,
-spill cleanup, verification result reporting, cutover step resumption, status,
+spill cleanup, verification result reporting, cutover step resumption and its schema parity refusal, status,
 and metrics.
 
 ```sh
@@ -41,7 +41,7 @@ Integration tests use Testcontainers, carry the `integration` build tag, and
 require a working Docker-compatible runtime. They exercise actual PostgreSQL
 behavior: exported snapshots, publication/slot ownership, preflight probes,
 binary and text COPY, indexes/FKs, pgoutput staging and replay, transactional
-target progress, range verification, sequence synchronization, and PostgreSQL
+target progress, range verification, sequence synchronization, schema parity (`internal/schemadiff`), and PostgreSQL
 version assumptions.
 
 ```sh

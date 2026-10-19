@@ -64,11 +64,14 @@ claim from the retained segment data and skips only work with a matching
 receipt. Finalized segments behind authoritative progress are pruned every
 `--segment-prune-interval`, retaining one safety segment.
 
-`pgmigrate cutover` then emits a logical boundary message, drains exactly through
-it, advances target sequences with headroom, reverts what the migration changed on
-both servers, and atomically writes `cutover-report.json`. It moves data and
-metadata and judges neither: freezing application writes and deciding the copy is
-good enough to serve are the operator's, done before it runs.
+`pgmigrate cutover` then checks that the target has every table, partition and
+valid index the source has for the migrated tables, emits a logical boundary
+message, drains exactly through it, advances target sequences with headroom,
+reverts what the migration changed on both servers, and atomically writes
+`cutover-report.json`. The catalog check is the only judgement it makes, because
+replication carries no DDL and nothing else would notice an index built on the
+source mid-run: freezing application writes and deciding the copy is good enough
+to serve remain the operator's, done before it runs.
 
 `pgmigrate sequences` runs that one step on its own, from `follow` onwards, for a
 cutover that moves traffic before it moves the database. Sequences are set
@@ -85,7 +88,7 @@ explains why the mechanism is what it is and what each choice cost,
 [Limitations](#limitations) what the tool does not do. Test patterns and
 environment controls are in [test/README.md](test/README.md).
 
-There are seven commands:
+There are eight commands:
 
 | command | what it does |
 |---|---|
@@ -94,8 +97,9 @@ There are seven commands:
 | `status` | reads local state only, so it is safe to run beside `run` |
 | `controller` | serves a guarded local dashboard for status, preflight, run, and verification |
 | `verify` | samples each table against the target and checks what replication wrote |
+| `schema-diff` | lists the tables, partitions and indexes the source has and the target lacks |
 | `sequences` | advances target sequences alone, so the target can take writes before the cutover |
-| `cutover` | performs the rerunnable, durably stepped cutover |
+| `cutover` | performs the rerunnable, durably stepped cutover, refusing a target that lacks a source table or index |
 
 Every command takes `--dir`. Database actions need source and target connection
 strings; `status` and the controller's read-only dashboard do not. `pgmigrate
@@ -497,6 +501,60 @@ standard error. A named divergence, or a table stopped early, exits non-zero.
 | `--verify-cdc-rows <n>` | `100000` | applier-recorded keys per table checked alongside the heap sample. `0` falls back to the default |
 | `--verify-ignore-apps <ids>` | empty | comma-separated positive `app_pk` IDs whose mismatches are audited but excluded from verification verdicts; copy, capture and replay are unchanged |
 
+### pgmigrate schema-diff
+
+Compares the source's catalog with the target's for the migrated tables, and lists
+what the target lacks: tables and partitions, compared by name and relkind, and
+valid indexes, compared by definition. It is the check `cutover` refuses on, run
+without cutting over. It reads both catalogs and nothing else, so it is safe beside
+`run`; it needs the `catchup` phase or later. The findings, with the statements to
+replay, go to standard error, the result to standard output as JSON, and the exit
+status is non-zero when anything is missing.
+
+pgmigrate restores the schema once, from the setup snapshot, and replicates DML
+only. An index or table created on the source after that, by an application
+migration or by hand, is not on the target and nothing in the stream says so. Run
+this after every schema change made during `follow`: an index found missing only at
+cutover has to be built while application writes are frozen, or the cutover
+abandoned until it is.
+
+Scope is the source as it is now, under the run's table filter: every table the
+filter selects and every partition beneath those tables, including ones created
+since setup. The run records its filter in the migration state; a migration started
+with a filter by a release that did not record it needs the same `--table-filter`
+here and at cutover.
+
+An index is compared by its `pg_get_indexdef` with the index name and the table
+stripped, read over an empty `search_path` on both sides, so a target index under
+another name with the same definition satisfies it, and one with the same name and
+a different definition does not. Uniqueness, method, keys, operator classes,
+`INCLUDE` columns, storage parameters and predicate are all part of the
+definition. Only valid source indexes count, and only valid target indexes satisfy
+them; an invalid target index of the same name is reported as a failed build to
+drop first. An expression or partial index that finds no definition match is still
+accepted when the target has an expression or partial index of the same name on
+the same table, because PostgreSQL can deparse an index rebuilt from its own
+rendering differently, the reason the index phase adopts those by name too; such
+matches are listed under `adopted`.
+
+Each missing index comes with its replay: `CREATE INDEX CONCURRENTLY` for an
+ordinary index, followed by `ALTER TABLE … ADD CONSTRAINT … USING INDEX` when it
+backs a primary key or unique constraint; `ON ONLY` for an index on a partitioned
+table, with each partition's index built concurrently and attached to it, the
+sequence the index phase uses. An exclusion constraint is declared directly, which
+blocks writes to its table while it builds. A missing table gets no generated DDL:
+its rows were never replicated, so creating it does not bring its data.
+
+It does not compare columns, constraints other than those backing an index,
+triggers, views or functions.
+
+| flag | default | what it does |
+|---|---|---|
+| `--dir <path>` | required | migration state directory |
+| `--source <dsn>` | `PGMIGRATE_SOURCE` | source connection string |
+| `--target <dsn>` | `PGMIGRATE_TARGET` | target connection string |
+| `--table-filter <file>` | the recorded filter | needed only for a filtered migration whose state predates the recorded filter; must match the run's |
+
 ### pgmigrate sequences
 
 Runs the cutover's sequence step on its own, from the `follow` phase onwards, for
@@ -522,17 +580,27 @@ traffic moves.
 ### pgmigrate cutover
 
 Performs the cutover as a sequence of durably recorded steps: validate the
-target identity, emit and record an end position, wait for `run` to drain exactly
+target identity, check that the target has every table and index the source has
+(see [pgmigrate schema-diff](#pgmigrate-schema-diff)), emit and record an end position, wait for `run` to drain exactly
 through it, advance sequences, clean up, and write the report. Re-running resumes
 at the first incomplete step and reuses the recorded end position. It requires an
 active `run` in the `follow` phase, and prints the report as JSON when it
 finishes. Run against an already complete migration, it re-prints the stored
 report.
 
-**It checks nothing.** Writes made on the source after the end position are not
-migrated and nothing here will notice, so freeze application writes before running
-it. It does not verify: run `pgmigrate verify` while `run` is still following, read
-the result, and decide for yourself.
+**It checks the catalog and nothing else.** A target that lacks a source table,
+partition or valid index stops the cutover before the end position is emitted, with
+the list and the statements to replay, and leaves nothing recorded: `run` keeps
+following, and once the objects exist the next attempt starts afresh.
+`--allow-missing-objects` cuts over regardless, for an emergency; the objects are
+still listed and are recorded in the report under `missing_objects`. A cutover
+already past its sequence step when it was upgraded to this release skips the
+check rather than strand itself half-done.
+
+Writes made on the source after the end position are not migrated and nothing here
+will notice, so freeze application writes before running it. It does not verify
+data: run `pgmigrate verify` while `run` is still following, read the result, and
+decide for yourself.
 
 | flag | default | what it does |
 |---|---|---|
@@ -542,6 +610,8 @@ the result, and decide for yourself.
 | `--endpos <LSN>` | the boundary cutover emits | explicit inclusive end position, for advanced use. Must resolve to an exact durable transaction or boundary |
 | `--sequence-offset <n>` | `1000000` | values each target sequence is set past the source's; see [pgmigrate sequences](#pgmigrate-sequences) |
 | `--no-cleanup` | false | retain the source replication objects and target migration metadata. Target tuning and target replica identities are still reverted, because the target is about to serve production |
+| `--allow-missing-objects` | false | cut over although the target lacks tables or indexes the source has. They are still printed and recorded in the report |
+| `--table-filter <file>` | the recorded filter | needed only for a filtered migration whose state predates the recorded filter; see [pgmigrate schema-diff](#pgmigrate-schema-diff) |
 
 ## Dependencies
 
@@ -565,8 +635,9 @@ The host needs durable local disk for CDC staged but not yet applied during
 copy, indexing, catch-up, and follow, plus temporary space for exceptionally
 large source transactions.
 
-DDL is neither replicated nor detected, so the source schema must be frozen for
-the whole run. Application writes may continue until you freeze them for cutover.
+DDL is not replicated, so the source schema should be frozen for the whole run.
+`schema-diff` and `cutover` detect a table, partition or index the target lacks,
+but not a changed column, constraint, trigger or function. Application writes may continue until you freeze them for cutover.
 
 ## Copy from a restored backup or clone
 
@@ -1209,7 +1280,9 @@ controlled by `PGMIGRATE_CDC_BENCH_TRANSACTIONS` and
 - One database per run; no fleet orchestration, bidirectional replication, or
   conflict resolution.
 - PostgreSQL 16 to 18 only, and no downgrade migration.
-- DDL is neither replicated nor automatically detected. Large objects are
+- DDL is not replicated. Missing tables, partitions and indexes are detected
+  (`schema-diff`, and the cutover refusal); changed columns, constraints, triggers,
+  views and functions are not. Large objects are
   preflight-blocked; foreign and unlogged tables and materialized views produce
   findings and need an operator plan.
 - The target is assumed not to receive independent application traffic before
@@ -1227,7 +1300,7 @@ controlled by `PGMIGRATE_CDC_BENCH_TRANSACTIONS` and
   deletes, cannot check a table with no primary key and no `NOT NULL` unique index at
   all, and checks the rows replication wrote as a capped sample of what the
   applier reported rather than exhaustively from the decoded stream.
-- Cutover enforces nothing. It does not check that application writes stopped and
+- Cutover enforces catalog parity only. It does not check that application writes stopped and
   does not verify the copy, so writes made after the end position are left behind
   silently and a divergent table will not stop it. Both are the operator's to
   establish beforehand, the second with `verify`.

@@ -300,7 +300,28 @@ def main(directory):
             assert resumed.poll() is None, log.read_text()
             return sql(target, "SELECT count(*) FROM items WHERE id=30006") == "1"
         wait(resumed_change, "CDC after resume without clone")
+
+        # DDL is not replicated. An index and a table created on the source
+        # after the schema phase are absent from the target, and cutover must
+        # refuse, name them, and leave nothing behind, so the run keeps
+        # following and a later cutover still works.
+        sql(source, "CREATE INDEX items_value_after_schema ON items(value); CREATE TABLE late(id int PRIMARY KEY)")
+        diff = subprocess.run([BINARY, "schema-diff", *flags], capture_output=True, text=True, timeout=120)
+        assert diff.returncode != 0 and "items_value_after_schema" in diff.stderr, diff.stderr
+        refused = subprocess.run([BINARY, "cutover", *flags], capture_output=True, text=True, timeout=120)
+        assert refused.returncode != 0, "cutover ignored objects the target lacks: " + refused.stdout
+        for name in ("items_value_after_schema", '"public"."late"', "CREATE INDEX CONCURRENTLY items_value_after_schema"):
+            assert name in refused.stderr, refused.stderr
+        print("cutover refused as expected: " + refused.stderr.strip().splitlines()[-1])
+        assert resumed.poll() is None, log.read_text()
+        assert json.loads(command(BINARY, "status", "--dir", str(state), "--json"))["phase"] == "follow"
+        # The index compares by definition, so a target index under another
+        # name satisfies it.
+        sql(target, "CREATE INDEX items_value_other_name ON items(value); CREATE TABLE late(id int PRIMARY KEY)")
+        command(BINARY, "schema-diff", *flags)
         command(BINARY, "cutover", *flags)
+        report = json.loads((state / "cutover-report.json").read_text())
+        assert "missing_objects" not in report, report
         assert resumed.wait(timeout=30) == 0, log.read_text()
         for table in ("items", "events", "keyless", "copy_blocker"):
             query = "SELECT row_to_json(t)::text FROM " + table + " t ORDER BY row_to_json(t)::text"
