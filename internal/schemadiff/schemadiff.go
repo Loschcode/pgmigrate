@@ -54,8 +54,8 @@ type Index struct {
 	// TargetInvalid marks an invalid target index of the same name, a failed
 	// build that has to be dropped before the DDL can run.
 	TargetInvalid bool `json:"target_invalid,omitempty"`
-	// TargetNameTaken marks a valid target index of the same name with another
-	// definition, which the DDL would collide with.
+	// TargetNameTaken marks a valid target index of the same name, on any
+	// table of the schema, which the DDL would collide with.
 	TargetNameTaken bool `json:"target_name_taken,omitempty"`
 }
 
@@ -116,7 +116,7 @@ func (r Result) Describe() string {
 			fmt.Fprintf(&b, "    note: the target has an invalid index of this name, a failed build; DROP INDEX CONCURRENTLY it first\n")
 		}
 		if x.TargetNameTaken {
-			fmt.Fprintf(&b, "    note: the target has a different index of this name; rename or drop it first\n")
+			fmt.Fprintf(&b, "    note: the target already has a valid index of this name; drop or rename it, or give the replayed index another name\n")
 		}
 		if x.Note != "" {
 			fmt.Fprintf(&b, "    note: %s\n", x.Note)
@@ -199,7 +199,10 @@ func Diff(ctx context.Context, source, target *pgx.Conn, selects SelectTable) (R
 	byDefinition := make(map[string]int, len(targetIndexes))
 	byName := make(map[string]catalogIndex, len(targetIndexes))
 	invalid := make(map[string]bool)
+	// Index names are unique per schema, whatever table holds them.
+	taken := make(map[string]bool, len(targetIndexes))
 	for _, x := range targetIndexes {
+		taken[key(x.Schema, x.Name)] = x.Valid
 		if !x.Valid {
 			invalid[key(x.Schema, x.Name)] = true
 			continue
@@ -237,7 +240,7 @@ func Diff(ctx context.Context, source, target *pgx.Conn, selects SelectTable) (R
 	for _, x := range absent {
 		index := replay(x, missing)
 		index.TargetInvalid = invalid[key(x.Schema, x.Name)]
-		_, index.TargetNameTaken = byName[key(x.Schema, x.Table, x.Name)]
+		index.TargetNameTaken = taken[key(x.Schema, x.Name)]
 		result.Indexes = append(result.Indexes, index)
 	}
 	return result, nil
