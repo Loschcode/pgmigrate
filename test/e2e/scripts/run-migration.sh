@@ -602,8 +602,9 @@ echo "apply advanced during verification: $applied_before -> $applied_after"
 "$E2E_DIR/scripts/pause-traffic.sh"
 
 # Verification is the operator's decision to make before cutting over, and this is
-# where the fixture makes it: cutover itself checks nothing, so a divergence found
-# here is the only thing standing between a bad copy and production.
+# where the fixture makes it: cutover checks only that the target has the source's
+# tables and indexes, not their data, so a divergence found here is the only thing
+# standing between a bad copy and production.
 echo "running verification before cutover"
 if [ "$driver" = controller ]; then
     controller_action verify
