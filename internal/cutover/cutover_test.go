@@ -248,6 +248,7 @@ func TestSchemaParityRefusalLeavesNoTrace(t *testing.T) {
 	store := &phaseStore{resumeState: resumeState{steps: map[string]bool{}}, phase: state.PhaseFollow}
 	cfg, emitted := schemaConfig(t, store, func(context.Context) (schemadiff.Result, error) { return missingIndex, nil })
 	cfg.WaitDrain = func(context.Context, string) error { t.Fatal("drain reached"); return nil }
+	cfg.Prepare = func(context.Context) error { t.Fatal("prepare reached"); return nil }
 	_, err := Run(context.Background(), *cfg)
 	var missing *MissingObjectsError
 	if !errors.As(err, &missing) || len(missing.Result.Indexes) != 1 {
@@ -330,5 +331,42 @@ func TestSchemaParityDoesNotRerun(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// A cutover begun by a release without the check can already have an end
+// position. Refusing then cannot undo it, so the refusal has to say that the
+// next attempt reuses it and writes must stay frozen.
+func TestSchemaParityRefusalNamesARecordedEndPosition(t *testing.T) {
+	t.Parallel()
+	store := &resumeState{steps: map[string]bool{stepEndPosition: true}, endPosition: "0/77"}
+	cfg, _ := schemaConfig(t, store, func(context.Context) (schemadiff.Result, error) { return missingIndex, nil })
+	_, err := Run(context.Background(), *cfg)
+	var missing *MissingObjectsError
+	if !errors.As(err, &missing) || !strings.Contains(err.Error(), "0/77") || !strings.Contains(err.Error(), "frozen") {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
+func TestPrepareRunsAfterTheCheckAndBeforeTheEndPosition(t *testing.T) {
+	t.Parallel()
+	store := &resumeState{steps: map[string]bool{}}
+	var order []string
+	cfg, _ := schemaConfig(t, store, func(context.Context) (schemadiff.Result, error) {
+		order = append(order, "check")
+		return schemadiff.Result{}, nil
+	})
+	cfg.Prepare = func(context.Context) error {
+		order = append(order, "prepare")
+		store.endPosition = "0/42"
+		return nil
+	}
+	cfg.EmitBoundary = func(context.Context) (string, error) {
+		t.Fatal("an end position set by Prepare was not used")
+		return "", nil
+	}
+	_, _ = Run(context.Background(), *cfg)
+	if strings.Join(order, ",") != "check,prepare" || store.endPosition != "0/42" {
+		t.Fatalf("order = %v, end position = %q", order, store.endPosition)
 	}
 }

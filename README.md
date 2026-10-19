@@ -507,7 +507,7 @@ Compares the source's catalog with the target's for the migrated tables, and lis
 what the target lacks: tables and partitions, compared by name and relkind, and
 valid indexes, compared by definition. It is the check `cutover` refuses on, run
 without cutting over. It reads both catalogs and nothing else, so it is safe beside
-`run`; it needs the `catchup` phase or later. The findings, with the statements to
+`run`; it needs the `catchup` phase or later, and a migration not yet complete. The findings, with the statements to
 replay, go to standard error, the result to standard output as JSON, and the exit
 status is non-zero when anything is missing.
 
@@ -593,9 +593,13 @@ partition or valid index stops the cutover before the end position is emitted, w
 the list and the statements to replay, and leaves nothing recorded: `run` keeps
 following, and once the objects exist the next attempt starts afresh.
 `--allow-missing-objects` cuts over regardless, for an emergency; the objects are
-still listed and are recorded in the report under `missing_objects`. A cutover
-already past its sequence step when it was upgraded to this release skips the
-check rather than strand itself half-done.
+still listed and are recorded in the report under `missing_objects`. An `--endpos`
+is recorded only after the check passes. Once passed or overridden, the verdict is
+recorded and a resumed attempt keeps it without checking again, as it keeps the
+end position. A cutover already past its sequence step when it was upgraded to
+this release skips the check rather than strand itself half-done; one that had
+only recorded its end position is still checked, and a refusal then says that the
+end position stands, so writes must stay frozen while the objects are built.
 
 Writes made on the source after the end position are not migrated and nothing here
 will notice, so freeze application writes before running it. It does not verify

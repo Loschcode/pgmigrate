@@ -100,9 +100,6 @@ func (a App) SchemaDiff(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	defer store.Close()
-	if err := validateTargetIdentity(ctx, cfg, store); err != nil {
-		return err
-	}
 	migration, err := store.Migration(ctx)
 	if err != nil {
 		return err
@@ -110,6 +107,11 @@ func (a App) SchemaDiff(ctx context.Context, cfg config.Config) error {
 	switch migration.Phase {
 	case state.PhasePreflight, state.PhaseSetup, state.PhaseSchema, state.PhaseCopy, state.PhaseIndexes:
 		return fmt.Errorf("schema-diff compares a restored target and needs the catchup phase or later, current phase is %s", migration.Phase)
+	case state.PhaseComplete:
+		return errors.New("the migration is complete and its target identity has been cleaned up; schema-diff compares a migration still in progress")
+	}
+	if err := validateTargetIdentity(ctx, cfg, store); err != nil {
+		return err
 	}
 	filter, err := migrationFilter(ctx, store, cfg.TableFilter)
 	if err != nil {

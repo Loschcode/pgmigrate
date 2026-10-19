@@ -335,6 +335,19 @@ func TestPG17InvalidTargetIndexIsFlagged(t *testing.T) {
 	}
 }
 
+func TestPG17ReplayNameTakenIsFlagged(t *testing.T) {
+	p := start(t, 17)
+	// The target holds the source's first index under the second one's name,
+	// so replaying the second as printed would collide.
+	exec(t, p.source, "CREATE INDEX devices_user_id ON app.devices (user_id)")
+	exec(t, p.target, "CREATE INDEX devices_user_id ON app.devices (app_pk, user_id)")
+	exec(t, p.target, "DROP INDEX app.devices_app_pk_user_id_idx")
+	result := p.diff(t)
+	if len(result.Indexes) != 1 || !result.Indexes[0].TargetNameTaken {
+		t.Fatalf("result = %#v", result.Indexes)
+	}
+}
+
 func TestCrossMajorIdenticalSchemas(t *testing.T) {
 	majors := pgtest.Majors(t)
 	if len(majors) < 2 {

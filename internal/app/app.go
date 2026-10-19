@@ -31,6 +31,7 @@ import (
 	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/preflight"
 	"github.com/GetStream/pgmigrate/internal/schema"
+	"github.com/GetStream/pgmigrate/internal/schemadiff"
 	"github.com/GetStream/pgmigrate/internal/setup"
 	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/GetStream/pgmigrate/internal/verify"
@@ -2658,10 +2659,6 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 		migration.Phase != state.PhaseCutover {
 		return fmt.Errorf("cutover requires follow phase, current phase is %s", migration.Phase)
 	}
-	filter, err := migrationFilter(ctx, store, cfg.TableFilter)
-	if err != nil {
-		return err
-	}
 	snapshot, err := readSnapshot(cfg.Dir)
 	if err != nil {
 		return err
@@ -2670,11 +2667,15 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	if err := setManualEndPosition(ctx, cfg.EndPosition, filepath.Join(cfg.Dir, "cdc"), recovery.DurableLSN, store); err != nil {
-		return err
-	}
-	if err := store.SetTargetCleanupRequested(ctx, !cfg.NoCleanup); err != nil {
-		return err
+	// Why: both write durable state, and the end position is reused by every
+	// later attempt. Recorded before a schema refusal, it would survive the
+	// operator unfreezing writes to build what was missing, and the next cutover
+	// would drain to it and leave those writes behind.
+	prepare := func(ctx context.Context) error {
+		if err := setManualEndPosition(ctx, cfg.EndPosition, filepath.Join(cfg.Dir, "cdc"), recovery.DurableLSN, store); err != nil {
+			return err
+		}
+		return store.SetTargetCleanupRequested(ctx, !cfg.NoCleanup)
 	}
 	durableTables, err := store.ListTables(ctx)
 	if err != nil {
@@ -2717,9 +2718,18 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 		Cleanup: func(ctx context.Context) error {
 			return cleanupAfterCutover(ctx, cfg, store, snapshot, sourceTables)
 		},
-		ToolVersion:         Version(),
-		AuditConfig:         map[string]string{"workers": strconv.Itoa(cfg.Workers)},
-		SchemaParity:        schemaParity(cfg, filter),
+		ToolVersion: Version(),
+		AuditConfig: map[string]string{"workers": strconv.Itoa(cfg.Workers)},
+		SchemaParity: func(ctx context.Context) (schemadiff.Result, error) {
+			// Resolved only when the check runs, so a cutover that skips it
+			// never needs a filter it cannot recover.
+			filter, err := migrationFilter(ctx, store, cfg.TableFilter)
+			if err != nil {
+				return schemadiff.Result{}, err
+			}
+			return schemaParity(cfg, filter)(ctx)
+		},
+		Prepare:             prepare,
 		AllowMissingObjects: cfg.AllowMissingObjects,
 	})
 	var missing *cutover.MissingObjectsError

@@ -7,7 +7,7 @@
 // follow, a table created by a migration, a partition attached to a migrated
 // partitioned table. Nothing in the replication stream marks the gap, so a
 // cutover would hand production a target without the object. This package is
-// how cutover and check-schema notice.
+// how cutover and schema-diff notice.
 package schemadiff
 
 import (
@@ -54,6 +54,9 @@ type Index struct {
 	// TargetInvalid marks an invalid target index of the same name, a failed
 	// build that has to be dropped before the DDL can run.
 	TargetInvalid bool `json:"target_invalid,omitempty"`
+	// TargetNameTaken marks a valid target index of the same name with another
+	// definition, which the DDL would collide with.
+	TargetNameTaken bool `json:"target_name_taken,omitempty"`
 }
 
 // Result lists every source object missing from the target.
@@ -111,6 +114,9 @@ func (r Result) Describe() string {
 			quote(x.Schema, x.Name), quote(x.Schema, x.Table), x.Definition)
 		if x.TargetInvalid {
 			fmt.Fprintf(&b, "    note: the target has an invalid index of this name, a failed build; DROP INDEX CONCURRENTLY it first\n")
+		}
+		if x.TargetNameTaken {
+			fmt.Fprintf(&b, "    note: the target has a different index of this name; rename or drop it first\n")
 		}
 		if x.Note != "" {
 			fmt.Fprintf(&b, "    note: %s\n", x.Note)
@@ -231,6 +237,7 @@ func Diff(ctx context.Context, source, target *pgx.Conn, selects SelectTable) (R
 	for _, x := range absent {
 		index := replay(x, missing)
 		index.TargetInvalid = invalid[key(x.Schema, x.Name)]
+		_, index.TargetNameTaken = byName[key(x.Schema, x.Table, x.Name)]
 		result.Indexes = append(result.Indexes, index)
 	}
 	return result, nil
@@ -454,7 +461,8 @@ func replay(x catalogIndex, missing map[string]bool) Index {
 		result.DDL = append(result.DDL, fmt.Sprintf("ALTER INDEX %s ATTACH PARTITION %s",
 			quote(x.ParentSchema, x.ParentName), quote(x.Schema, x.Name)))
 		if missing[key(x.ParentSchema, x.ParentName)] {
-			result.Note = "attaches to " + result.Parent + ", which is missing too: create that one first"
+			result.Note = strings.TrimPrefix(result.Note+"; attaches to "+result.Parent+
+				", which is missing too: create that one first", "; ")
 		}
 	}
 	return result
@@ -515,11 +523,22 @@ func (r *Result) Sort() {
 	sort.Slice(r.Tables, func(i, j int) bool {
 		return key(r.Tables[i].Schema, r.Tables[i].Name) < key(r.Tables[j].Schema, r.Tables[j].Name)
 	})
-	// Partitioned parents come before the partition indexes that attach to
-	// them, so the replay statements can be run top to bottom.
-	sort.Slice(r.Indexes, func(i, j int) bool {
-		if (r.Indexes[i].Parent == "") != (r.Indexes[j].Parent == "") {
-			return r.Indexes[i].Parent == ""
+	// A partitioned index comes before every partition index that attaches to
+	// it, at any depth, so the replay statements can be run top to bottom.
+	parents := make(map[string]string, len(r.Indexes))
+	for _, x := range r.Indexes {
+		parents[quote(x.Schema, x.Name)] = x.Parent
+	}
+	depth := func(x Index) int {
+		n := 0
+		for parent := x.Parent; parent != "" && n < len(parents); parent = parents[parent] {
+			n++
+		}
+		return n
+	}
+	sort.SliceStable(r.Indexes, func(i, j int) bool {
+		if di, dj := depth(r.Indexes[i]), depth(r.Indexes[j]); di != dj {
+			return di < dj
 		}
 		return key(r.Indexes[i].Schema, r.Indexes[i].Table, r.Indexes[i].Name) <
 			key(r.Indexes[j].Schema, r.Indexes[j].Table, r.Indexes[j].Name)

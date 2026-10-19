@@ -75,10 +75,18 @@ type Report struct {
 // or indexes the source has.
 type MissingObjectsError struct {
 	Result schemadiff.Result
+	// EndPosition is an end position an earlier attempt already recorded,
+	// which the next attempt will reuse.
+	EndPosition string
 }
 
 func (e *MissingObjectsError) Error() string {
-	return e.Result.Summary() + "; create them on the target, or rerun with --allow-missing-objects to cut over without them"
+	message := e.Result.Summary() + "; create them on the target, or rerun with --allow-missing-objects to cut over without them"
+	if e.EndPosition != "" {
+		message += "; an earlier attempt recorded end position " + e.EndPosition +
+			", which the next attempt reuses, so keep application writes frozen while you do"
+	}
+	return message
 }
 
 // ReportConfiguration captures the settings that shaped this cutover.
@@ -113,6 +121,10 @@ type Config struct {
 	// missing anything refuses the cutover unless AllowMissingObjects.
 	SchemaParity        func(context.Context) (schemadiff.Result, error)
 	AllowMissingObjects bool
+	// Prepare, when set, runs after the schema check passes and before the end
+	// position is read, for the caller's own durable writes, such as an
+	// explicit end position, that a refusal must not leave behind.
+	Prepare func(context.Context) error
 
 	// EmitBoundary is a test seam, and the hook production uses to mark the end
 	// position in the stream itself rather than inferring it. Left nil it falls
@@ -169,6 +181,11 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 
 	if err := checkSchemaParity(ctx, cfg); err != nil {
 		return Report{}, err
+	}
+	if cfg.Prepare != nil {
+		if err := cfg.Prepare(ctx); err != nil {
+			return Report{}, err
+		}
 	}
 
 	migration, err := cfg.State.Migration(ctx)
@@ -287,7 +304,13 @@ func checkSchemaParity(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("%s: %w", stepSchema, err)
 	}
 	if result.Missing() && !cfg.AllowMissingObjects {
-		return &MissingObjectsError{Result: result}
+		// Only a cutover begun by a release without this check, or one given
+		// an explicit end position by such a release, gets here with one.
+		migration, err := cfg.State.Migration(ctx)
+		if err != nil {
+			return err
+		}
+		return &MissingObjectsError{Result: result, EndPosition: migration.EndPosition}
 	}
 	detail, err := json.Marshal(result)
 	if err != nil {
