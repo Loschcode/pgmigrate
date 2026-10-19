@@ -49,6 +49,8 @@ func NewRootCommand() *cobra.Command {
 	flags.BoolVar(&cfg.AckWarnings, "ack-warnings", false, "acknowledge all preflight warnings")
 	flags.BoolVar(&cfg.AllowCollationChange, "allow-collation-change", false,
 		"migrate to a target that collates text differently from the source")
+	flags.BoolVar(&cfg.AllowMissingObjects, "allow-missing-objects", false,
+		"cut over although the target lacks tables or indexes the source has; they are still listed and recorded in the report")
 	flags.IntVar(&cfg.Workers, "workers", cfg.Workers, "parallel copy and index-build workers (verification has --verify-workers)")
 	flags.Int64Var(&cfg.SplitThreshold, "split-threshold", cfg.SplitThreshold, "table bytes per copy part")
 	flags.IntVar(&cfg.RestoreJobs, "restore-jobs", cfg.RestoreJobs, "parallel pg_restore jobs")
@@ -91,6 +93,7 @@ func NewRootCommand() *cobra.Command {
 		newDatabaseCommand("run", "Start or resume a migration", &cfg, application.Run),
 		newStateCommand("status", "Show migration progress", &cfg, false, application.Status),
 		newStateCommand("verify", "Verify source and target data", &cfg, true, application.Verify),
+		newStateCommand("schema-diff", "List tables and indexes the source has and the target lacks", &cfg, true, application.SchemaDiff),
 		newStateCommand("sequences", "Advance target sequences past the source", &cfg, true, application.Sequences),
 		newStateCommand("cutover", "Finalize a migration for cutover", &cfg, true, application.Cutover),
 		newControllerCommand(&cfg),

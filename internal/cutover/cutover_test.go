@@ -3,17 +3,22 @@ package cutover
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/schemadiff"
 	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/jackc/pgx/v5"
 )
 
+func clean(context.Context) (schemadiff.Result, error) { return schemadiff.Result{}, nil }
+
 type resumeState struct {
 	mu          sync.Mutex
 	steps       map[string]bool
+	details     map[string]string
 	endPosition string
 	failReport  bool
 }
@@ -24,14 +29,21 @@ func (s *resumeState) StepCompleted(_ context.Context, name string) (bool, error
 	return s.steps[name], nil
 }
 
-func (s *resumeState) CompleteStep(_ context.Context, name, _ string) error {
+func (s *resumeState) CompleteStep(_ context.Context, name, detail string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if name == stepReport && s.failReport {
 		s.failReport = false
 		return errors.New("injected marker failure")
 	}
+	if s.steps[name] {
+		return nil
+	}
 	s.steps[name] = true
+	if s.details == nil {
+		s.details = map[string]string{}
+	}
+	s.details[name] = detail
 	return nil
 }
 
@@ -53,7 +65,7 @@ func (s *resumeState) ListSteps(context.Context) ([]state.Step, error) {
 	defer s.mu.Unlock()
 	var result []state.Step
 	for name, done := range s.steps {
-		result = append(result, state.Step{Name: name, Completed: done})
+		result = append(result, state.Step{Name: name, Completed: done, Detail: s.details[name]})
 	}
 	return result, nil
 }
@@ -84,9 +96,10 @@ func TestReportResumesAfterMarkerFailure(t *testing.T) {
 			t.Fatal("completed cleanup unexpectedly reran")
 			return nil
 		},
-		Now:         func() time.Time { return now },
-		ToolVersion: "v1.2.3",
-		AuditConfig: map[string]string{"migration": "test"},
+		Now:          func() time.Time { return now },
+		SchemaParity: clean,
+		ToolVersion:  "v1.2.3",
+		AuditConfig:  map[string]string{"migration": "test"},
 	}
 	if _, err := Run(context.Background(), cfg); err == nil {
 		t.Fatal("expected injected report marker failure")
@@ -132,7 +145,8 @@ func TestResumeReusesTheBoundaryTheFirstAttemptEmitted(t *testing.T) {
 			}
 			return nil
 		},
-		Cleanup: func(context.Context) error { return nil },
+		Cleanup:      func(context.Context) error { return nil },
+		SchemaParity: clean,
 	}
 	if _, err := Run(context.Background(), cfg); err == nil {
 		t.Fatal("expected the first attempt to fail draining")
@@ -179,9 +193,10 @@ func TestLifecycleTransitionsAndReportConfiguration(t *testing.T) {
 		Source: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unexpected source connection") },
 		Target: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unexpected target connection") },
 		State:  store, Dir: t.TempDir(), ToolVersion: "test-version",
-		AuditConfig: map[string]string{"profile": "safe"},
-		WaitDrain:   func(context.Context, string) error { return nil },
-		Cleanup:     func(context.Context) error { return nil },
+		AuditConfig:  map[string]string{"profile": "safe"},
+		WaitDrain:    func(context.Context, string) error { return nil },
+		Cleanup:      func(context.Context) error { return nil },
+		SchemaParity: clean,
 	}
 	report, err := Run(context.Background(), cfg)
 	if err != nil {
@@ -198,5 +213,122 @@ func TestLifecycleTransitionsAndReportConfiguration(t *testing.T) {
 	}
 	if report.ToolVersion != "test-version" || report.Configuration.Values["profile"] != "safe" {
 		t.Fatalf("report configuration = %#v", report)
+	}
+}
+
+var missingIndex = schemadiff.Result{Indexes: []schemadiff.Index{{
+	Schema: "app", Table: "devices", Name: "devices_app_pk_user_id_non_disabled",
+	Definition: "CREATE INDEX devices_app_pk_user_id_non_disabled ON app.devices USING btree (app_pk, user_id) WHERE (NOT disabled)",
+}}}
+
+// schemaConfig is a cutover whose steps after the parity check fail loudly or
+// are observable, so a test can tell how far an attempt got.
+func schemaConfig(t *testing.T, store State, parity func(context.Context) (schemadiff.Result, error)) (*Config, *int) {
+	t.Helper()
+	emitted := 0
+	refuse := func(context.Context) (*pgx.Conn, error) { return nil, errors.New("sequences reached") }
+	return &Config{
+		Source: refuse, Target: refuse, State: store, Dir: t.TempDir(),
+		EmitBoundary: func(context.Context) (string, error) {
+			emitted++
+			return "0/900", nil
+		},
+		WaitDrain:    func(context.Context, string) error { return nil },
+		Cleanup:      func(context.Context) error { t.Fatal("cleanup reached"); return nil },
+		SchemaParity: parity,
+	}, &emitted
+}
+
+// A refused cutover must leave nothing durable behind. In particular no end
+// position: one recorded here would be reused by the next attempt, after the
+// operator had unfrozen writes to build what was missing, and every write made
+// in between would be left behind on the source.
+func TestSchemaParityRefusalLeavesNoTrace(t *testing.T) {
+	t.Parallel()
+	store := &phaseStore{resumeState: resumeState{steps: map[string]bool{}}, phase: state.PhaseFollow}
+	cfg, emitted := schemaConfig(t, store, func(context.Context) (schemadiff.Result, error) { return missingIndex, nil })
+	cfg.WaitDrain = func(context.Context, string) error { t.Fatal("drain reached"); return nil }
+	_, err := Run(context.Background(), *cfg)
+	var missing *MissingObjectsError
+	if !errors.As(err, &missing) || len(missing.Result.Indexes) != 1 {
+		t.Fatalf("Run() error = %v, want a MissingObjectsError naming the index", err)
+	}
+	if *emitted != 0 || store.endPosition != "" {
+		t.Fatalf("refusal emitted %d boundaries, recorded end position %q", *emitted, store.endPosition)
+	}
+	if len(store.steps) != 0 || len(store.transitions) != 0 {
+		t.Fatalf("refusal recorded steps %v and transitions %v", store.steps, store.transitions)
+	}
+}
+
+func TestSchemaParityRerunAfterFixPasses(t *testing.T) {
+	t.Parallel()
+	store := &resumeState{steps: map[string]bool{}}
+	result := missingIndex
+	cfg, emitted := schemaConfig(t, store, func(context.Context) (schemadiff.Result, error) { return result, nil })
+	if _, err := Run(context.Background(), *cfg); !errors.As(err, new(*MissingObjectsError)) {
+		t.Fatalf("first attempt error = %v, want a refusal", err)
+	}
+	result = schemadiff.Result{}
+	if _, err := Run(context.Background(), *cfg); err == nil || !strings.Contains(err.Error(), "sequences reached") {
+		t.Fatalf("second attempt error = %v, want it to proceed to sequences", err)
+	}
+	if !store.steps[stepSchema] || !store.steps[stepDrain] || *emitted != 1 {
+		t.Fatalf("steps = %v, boundaries emitted = %d", store.steps, *emitted)
+	}
+}
+
+func TestSchemaParityOverrideProceedsAndRecords(t *testing.T) {
+	t.Parallel()
+	store := &resumeState{steps: map[string]bool{}}
+	checks := 0
+	cfg, _ := schemaConfig(t, store, func(context.Context) (schemadiff.Result, error) {
+		checks++
+		return missingIndex, nil
+	})
+	cfg.AllowMissingObjects = true
+	if _, err := Run(context.Background(), *cfg); err == nil || !strings.Contains(err.Error(), "sequences reached") {
+		t.Fatalf("overridden attempt error = %v, want it to proceed to sequences", err)
+	}
+	if !strings.Contains(store.details[stepSchema], "devices_app_pk_user_id_non_disabled") {
+		t.Fatalf("schema step detail = %q, want the acknowledged index", store.details[stepSchema])
+	}
+	// Finish the cutover; the resumed attempt keeps the recorded verdict and
+	// puts the acknowledged objects in the report.
+	store.steps[stepSequences], store.steps[stepCleanup] = true, true
+	cfg.Cleanup = func(context.Context) error { return nil }
+	report, err := Run(context.Background(), *cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checks != 1 {
+		t.Fatalf("parity checked %d times, want once", checks)
+	}
+	if report.MissingObjects == nil || len(report.MissingObjects.Indexes) != 1 {
+		t.Fatalf("report missing objects = %#v", report.MissingObjects)
+	}
+}
+
+func TestSchemaParityDoesNotRerun(t *testing.T) {
+	t.Parallel()
+	for name, steps := range map[string]map[string]bool{
+		// A verdict already recorded stands.
+		"recorded": {stepSchema: true, stepEndPosition: true, stepDrain: true, stepSequences: true, stepCleanup: true},
+		// A cutover started by a release without the check is past the point
+		// where refusing could prevent anything.
+		"past sequences": {stepEndPosition: true, stepDrain: true, stepSequences: true, stepCleanup: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			store := &resumeState{steps: steps, endPosition: "0/1"}
+			cfg, _ := schemaConfig(t, store, func(context.Context) (schemadiff.Result, error) {
+				t.Fatal("schema parity rechecked")
+				return schemadiff.Result{}, nil
+			})
+			cfg.Cleanup = func(context.Context) error { return nil }
+			if _, err := Run(context.Background(), *cfg); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

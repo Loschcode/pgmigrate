@@ -12,11 +12,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/schemadiff"
 	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/jackc/pgx/v5"
 )
 
 const (
+	stepSchema      = "cutover.schema"
 	stepEndPosition = "cutover.end_position"
 	stepDrain       = "cutover.drain"
 	stepSequences   = "cutover.sequences"
@@ -63,7 +65,20 @@ type Report struct {
 	CompletedAt   time.Time           `json:"completed_at"`
 	EndPosition   string              `json:"end_position"`
 	Sequences     []SequenceResult    `json:"sequences,omitempty"`
-	Steps         []state.Step        `json:"steps"`
+	// MissingObjects is what the target lacked when the operator cut over
+	// regardless, with --allow-missing-objects. A clean target leaves it out.
+	MissingObjects *schemadiff.Result `json:"missing_objects,omitempty"`
+	Steps          []state.Step       `json:"steps"`
+}
+
+// MissingObjectsError is the refusal to cut over to a target that lacks tables
+// or indexes the source has.
+type MissingObjectsError struct {
+	Result schemadiff.Result
+}
+
+func (e *MissingObjectsError) Error() string {
+	return e.Result.Summary() + "; create them on the target, or rerun with --allow-missing-objects to cut over without them"
 }
 
 // ReportConfiguration captures the settings that shaped this cutover.
@@ -74,11 +89,14 @@ type ReportConfiguration struct {
 
 // Config controls the ordered, rerunnable cutover steps.
 //
-// Cutover moves data and metadata; it does not judge either. It neither samples
-// the source for writes nor verifies the copy, so freezing application writes and
-// deciding that the data is good enough to serve are the operator's, done before
-// this runs. Nothing here will stop a cutover that loses writes made after the
-// end position.
+// Cutover moves data and metadata and judges one thing only: that the target
+// has every table, partition and valid index the source has for the migrated
+// tables. Replication carries no DDL, so an index or table created on the source
+// after the schema phase is otherwise absent from the target with nothing to say
+// so. It neither samples the source for writes nor verifies the copy, so freezing
+// application writes and deciding that the data is good enough to serve are the
+// operator's, done before this runs. Nothing here will stop a cutover that loses
+// writes made after the end position.
 type Config struct {
 	Source, Target Connector
 	State          State
@@ -91,6 +109,11 @@ type Config struct {
 	ToolVersion    string
 	AuditConfig    map[string]string
 
+	// SchemaParity compares the two catalogs; see schemadiff.Diff. A target
+	// missing anything refuses the cutover unless AllowMissingObjects.
+	SchemaParity        func(context.Context) (schemadiff.Result, error)
+	AllowMissingObjects bool
+
 	// EmitBoundary is a test seam, and the hook production uses to mark the end
 	// position in the stream itself rather than inferring it. Left nil it falls
 	// back to the source's current flush position.
@@ -101,9 +124,9 @@ type Config struct {
 // action succeeds, so process restarts safely resume from the first missing
 // marker.
 func Run(ctx context.Context, cfg Config) (Report, error) {
-	if cfg.Source == nil || cfg.Target == nil || cfg.State == nil ||
+	if cfg.Source == nil || cfg.Target == nil || cfg.State == nil || cfg.SchemaParity == nil ||
 		cfg.WaitDrain == nil || cfg.Cleanup == nil || strings.TrimSpace(cfg.Dir) == "" {
-		return Report{}, errors.New("source, target, state, directory, drain, and cleanup are required")
+		return Report{}, errors.New("source, target, state, directory, schema parity, drain, and cleanup are required")
 	}
 	if cfg.SequenceOffset < 0 {
 		return Report{}, errors.New("sequence offset must not be negative")
@@ -142,6 +165,10 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 			SequenceOffset: cfg.SequenceOffset,
 			Values:         cloneStrings(cfg.AuditConfig),
 		},
+	}
+
+	if err := checkSchemaParity(ctx, cfg); err != nil {
+		return Report{}, err
 	}
 
 	migration, err := cfg.State.Migration(ctx)
@@ -238,6 +265,40 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	return report, nil
 }
 
+// checkSchemaParity runs first, before the end position exists, so that a
+// refusal leaves no durable trace: no boundary, no marker, no phase change. The
+// operator can unfreeze the application, build what is missing, and cut over
+// again later with a fresh end position. Refused, it writes nothing and every
+// attempt checks again; passed or overridden, the verdict is recorded and a
+// resumed cutover keeps it, as every other step's.
+func checkSchemaParity(ctx context.Context, cfg Config) error {
+	done, err := cfg.State.StepCompleted(ctx, stepSchema)
+	if err != nil || done {
+		return err
+	}
+	// Why: a cutover begun by a release without this step may already have
+	// advanced the target's sequences. Refusing past that point would strand a
+	// half-finished cutover rather than prevent one.
+	if done, err := cfg.State.StepCompleted(ctx, stepSequences); err != nil || done {
+		return err
+	}
+	result, err := cfg.SchemaParity(ctx)
+	if err != nil {
+		return fmt.Errorf("%s: %w", stepSchema, err)
+	}
+	if result.Missing() && !cfg.AllowMissingObjects {
+		return &MissingObjectsError{Result: result}
+	}
+	detail, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", stepSchema, err)
+	}
+	if err := cfg.State.CompleteStep(ctx, stepSchema, string(detail)); err != nil {
+		return fmt.Errorf("complete %s: %w", stepSchema, err)
+	}
+	return nil
+}
+
 func transitionOptional(ctx context.Context, store State, phase state.Phase) error {
 	phases, ok := store.(phaseState)
 	if !ok {
@@ -267,6 +328,12 @@ func hydrateReportDetails(report *Report) {
 		}
 		if step.Name == stepSequences && report.Sequences == nil {
 			_ = json.Unmarshal([]byte(step.Detail), &report.Sequences)
+		}
+		if step.Name == stepSchema && report.MissingObjects == nil {
+			var result schemadiff.Result
+			if json.Unmarshal([]byte(step.Detail), &result) == nil && result.Missing() {
+				report.MissingObjects = &result
+			}
 		}
 	}
 }

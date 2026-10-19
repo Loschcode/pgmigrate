@@ -46,6 +46,7 @@ type Config struct {
 	TableFilter            string
 	AckWarnings            bool
 	AllowCollationChange   bool
+	AllowMissingObjects    bool
 	Workers                int
 	SplitThreshold         int64
 	RestoreJobs            int

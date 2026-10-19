@@ -176,6 +176,9 @@ func (a App) Preflight(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	defer store.Close()
+	if err := recordFilterRules(ctx, store, filter); err != nil {
+		return err
+	}
 	preflightSelection, err := dumpSelection(ctx, cfg.Source, "", tables)
 	if err != nil {
 		return err
@@ -421,6 +424,9 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	}
 	defer store.Close()
 	defer func() { recordFailedAttempt(ctx, a.output(), cfg.Dir, store, runErr) }()
+	if err := recordFilterRules(ctx, store, filter); err != nil {
+		return err
+	}
 	migration, err := store.Migration(ctx)
 	if err != nil {
 		return err
@@ -2652,6 +2658,10 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 		migration.Phase != state.PhaseCutover {
 		return fmt.Errorf("cutover requires follow phase, current phase is %s", migration.Phase)
 	}
+	filter, err := migrationFilter(ctx, store, cfg.TableFilter)
+	if err != nil {
+		return err
+	}
 	snapshot, err := readSnapshot(cfg.Dir)
 	if err != nil {
 		return err
@@ -2707,11 +2717,20 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 		Cleanup: func(ctx context.Context) error {
 			return cleanupAfterCutover(ctx, cfg, store, snapshot, sourceTables)
 		},
-		ToolVersion: Version(),
-		AuditConfig: map[string]string{"workers": strconv.Itoa(cfg.Workers)},
+		ToolVersion:         Version(),
+		AuditConfig:         map[string]string{"workers": strconv.Itoa(cfg.Workers)},
+		SchemaParity:        schemaParity(cfg, filter),
+		AllowMissingObjects: cfg.AllowMissingObjects,
 	})
+	var missing *cutover.MissingObjectsError
+	if errors.As(err, &missing) {
+		fmt.Fprint(a.progressOutput(), missing.Result.Describe())
+	}
 	if err != nil {
 		return err
+	}
+	if report.MissingObjects != nil {
+		fmt.Fprint(a.progressOutput(), "cut over with --allow-missing-objects; "+report.MissingObjects.Describe())
 	}
 	return json.NewEncoder(a.output()).Encode(report)
 }
