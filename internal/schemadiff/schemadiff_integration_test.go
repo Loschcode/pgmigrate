@@ -24,6 +24,8 @@ const baseline = `
 	CREATE INDEX devices_app_pk_user_id_idx ON app.devices (app_pk, user_id);
 	CREATE INDEX devices_lower_name ON app.devices (lower(name)) WHERE NOT disabled;
 	CREATE INDEX devices_name_trgm ON app.devices USING gin (name public.gin_trgm_ops);
+	CREATE INDEX devices_covering ON app.devices (app_pk DESC NULLS LAST, name COLLATE "C") INCLUDE (user_id) WITH (fillfactor = 80);
+	CREATE UNIQUE INDEX devices_nnd ON app.devices (name) NULLS NOT DISTINCT;
 	CREATE TABLE app.events (id bigint, at date NOT NULL, PRIMARY KEY (id, at)) PARTITION BY RANGE (at);
 	CREATE TABLE app.events_2026_09 PARTITION OF app.events FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
 	CREATE INDEX events_at_idx ON app.events (at);
