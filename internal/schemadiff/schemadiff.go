@@ -36,6 +36,13 @@ type Table struct {
 	TargetRelKind string `json:"target_relkind,omitempty"`
 	// Parent names the partitioned table this one is a partition of.
 	Parent string `json:"parent,omitempty"`
+	// TargetParent is what the same-named target relation of the same kind is
+	// a partition of, empty when it is not a partition. Set only when it
+	// differs from Parent: a detached partition, or one attached elsewhere.
+	TargetParent string `json:"target_parent,omitempty"`
+	// ParentMismatch marks a target relation of the right kind attached to
+	// another parent, or to none.
+	ParentMismatch bool `json:"parent_mismatch,omitempty"`
 }
 
 // Index is a valid source index with no equivalent valid target index.
@@ -54,8 +61,10 @@ type Index struct {
 	// TargetInvalid marks an invalid target index of the same name, a failed
 	// build that has to be dropped before the DDL can run.
 	TargetInvalid bool `json:"target_invalid,omitempty"`
-	// TargetNameTaken marks a valid target index of the same name, on any
-	// table of the schema, which the DDL would collide with.
+	// TargetNameTaken marks a valid target index of the same name on one of
+	// the migration's tables, which the DDL would collide with. A clash with
+	// another relation of that name elsewhere in the schema is not detected
+	// here; the replayed CREATE INDEX then fails with "already exists".
 	TargetNameTaken bool `json:"target_name_taken,omitempty"`
 }
 
@@ -84,6 +93,9 @@ func (r Result) Describe() string {
 	for _, t := range r.Tables {
 		name := quote(t.Schema, t.Name)
 		switch {
+		case t.ParentMismatch:
+			fmt.Fprintf(&b, "  table %s is %s on the source and %s on the target\n",
+				name, partitionOf(t.Parent), partitionOf(t.TargetParent))
 		case t.TargetRelKind != "":
 			fmt.Fprintf(&b, "  table %s is relkind %s on the source and %s on the target\n",
 				name, relkindName(t.RelKind), relkindName(t.TargetRelKind))
@@ -95,8 +107,8 @@ func (r Result) Describe() string {
 	}
 	var roots, partitions bool
 	for _, t := range r.Tables {
-		roots = roots || t.Parent == "" && t.TargetRelKind == ""
-		partitions = partitions || t.Parent != "" && t.TargetRelKind == ""
+		roots = roots || t.Parent == "" && t.TargetRelKind == "" && !t.ParentMismatch
+		partitions = partitions || t.Parent != "" && t.TargetRelKind == "" && !t.ParentMismatch
 	}
 	if roots {
 		b.WriteString("  A missing table's rows were never replicated: the publication is the table list fixed at setup,\n" +
@@ -172,14 +184,21 @@ func Diff(ctx context.Context, source, target *pgx.Conn, selects SelectTable) (R
 		return Result{}, err
 	}
 	for _, relation := range relations {
-		kind, ok := present[key(relation.Schema, relation.Name)]
-		if ok && kind == relation.RelKind {
+		found, ok := present[key(relation.Schema, relation.Name)]
+		if ok && found.Kind == relation.RelKind && found.Parent == relation.Parent {
 			continue
 		}
-		result.Tables = append(result.Tables, Table{
-			Schema: relation.Schema, Name: relation.Name, RelKind: relation.RelKind,
-			TargetRelKind: kind, Parent: relation.Parent,
-		})
+		table := Table{Schema: relation.Schema, Name: relation.Name, RelKind: relation.RelKind,
+			TargetRelKind: found.Kind, Parent: relation.Parent}
+		if ok && found.Kind == relation.RelKind {
+			// Right kind, wrong place in the partition tree: rows the source
+			// routes through the parent would land in a table the target's
+			// parent never reads.
+			table.TargetRelKind = ""
+			table.ParentMismatch = true
+			table.TargetParent = found.Parent
+		}
+		result.Tables = append(result.Tables, table)
 	}
 
 	sourceIndexes, err := readIndexes(ctx, source, relations, true)
@@ -251,7 +270,8 @@ func sourceRelations(ctx context.Context, source *pgx.Conn, selects SelectTable)
 		SELECT c.oid, n.nspname, c.relname, c.relkind::text
 		FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
 		WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema')
-		  AND n.nspname !~ '^pg_toast' AND NOT c.relispartition
+		  AND n.nspname !~ '^pg_toast' AND n.nspname !~ '^pg_temp_' AND c.relpersistence <> 't'
+		  AND NOT c.relispartition
 		ORDER BY n.nspname, c.relname`)
 	if err != nil {
 		return nil, fmt.Errorf("inventory source tables: %w", err)
@@ -310,21 +330,30 @@ func sourceRelations(ctx context.Context, source *pgx.Conn, selects SelectTable)
 	return append(selected, partitions...), nil
 }
 
-func targetRelations(ctx context.Context, target *pgx.Conn, relations []sourceRelation) (map[string]string, error) {
+// targetRelation is the kind of a same-named target relation and, when it is
+// a partition, the qualified name of its parent, rendered as sourceRelations
+// renders Parent.
+type targetRelation struct{ Kind, Parent string }
+
+func targetRelations(ctx context.Context, target *pgx.Conn, relations []sourceRelation) (map[string]targetRelation, error) {
 	schemas, names := relationNames(relations)
 	rows, err := target.Query(ctx, `
-		SELECT n.nspname, c.relname, c.relkind::text
+		SELECT n.nspname, c.relname, c.relkind::text,
+		       coalesce(quote_ident(pn.nspname)||'.'||quote_ident(p.relname),'')
 		FROM unnest($1::text[], $2::text[]) AS wanted(nspname, relname)
 		JOIN pg_catalog.pg_namespace n ON n.nspname=wanted.nspname
-		JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=wanted.relname`,
+		JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=wanted.relname
+		LEFT JOIN pg_catalog.pg_inherits h ON h.inhrelid=c.oid AND c.relispartition
+		LEFT JOIN pg_catalog.pg_class p ON p.oid=h.inhparent
+		LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid=p.relnamespace`,
 		schemas, names)
 	if err != nil {
 		return nil, fmt.Errorf("inventory target tables: %w", err)
 	}
-	present := make(map[string]string, len(relations))
-	var schema, name, kind string
-	_, err = pgx.ForEachRow(rows, []any{&schema, &name, &kind}, func() error {
-		present[key(schema, name)] = kind
+	present := make(map[string]targetRelation, len(relations))
+	var schema, name, kind, parent string
+	_, err = pgx.ForEachRow(rows, []any{&schema, &name, &kind, &parent}, func() error {
+		present[key(schema, name)] = targetRelation{Kind: kind, Parent: parent}
 		return nil
 	})
 	if err != nil {
@@ -390,7 +419,10 @@ func readIndexes(ctx context.Context, conn *pgx.Conn, relations []sourceRelation
 		if onlyValid && !x.Valid {
 			return nil
 		}
-		x.Canonical = canonical(x.Definition, prefix, table, unique)
+		// The constraint an index backs is part of what it is: a plain unique
+		// index of the same definition does not give the target its primary
+		// key or replica identity.
+		x.Canonical = x.ConstraintType + ":" + canonical(x.Definition, prefix, table, unique)
 		indexes = append(indexes, x)
 		return nil
 	})
@@ -503,6 +535,13 @@ func relationNames(relations []sourceRelation) ([]string, []string) {
 func key(parts ...string) string { return strings.Join(parts, "\x00") }
 
 func quote(parts ...string) string { return pgx.Identifier(parts).Sanitize() }
+
+func partitionOf(parent string) string {
+	if parent == "" {
+		return "not a partition"
+	}
+	return "a partition of " + parent
+}
 
 func relkindName(kind string) string {
 	switch kind {

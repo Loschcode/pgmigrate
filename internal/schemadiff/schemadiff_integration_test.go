@@ -348,6 +348,40 @@ func TestPG17ReplayNameTakenIsFlagged(t *testing.T) {
 	}
 }
 
+func TestPG17SourceTempTableIsIgnored(t *testing.T) {
+	p := start(t, 17)
+	// An application session holding a temp table at cutover is not a table
+	// the target lacks.
+	exec(t, p.source, "CREATE TEMP TABLE scratch (id int); CREATE INDEX scratch_id ON scratch (id)")
+	if result := p.diff(t); result.Missing() {
+		t.Fatalf("temp table reported %s", result.Describe())
+	}
+}
+
+func TestPG17DetachedPartitionIsMissing(t *testing.T) {
+	p := start(t, 17)
+	exec(t, p.target, "ALTER TABLE app.events DETACH PARTITION app.events_2026_09")
+	result := p.diff(t)
+	if len(result.Tables) != 1 || !result.Tables[0].ParentMismatch ||
+		result.Tables[0].Parent != "app.events" || result.Tables[0].TargetParent != "" {
+		t.Fatalf("tables = %#v\n%s", result.Tables, result.Describe())
+	}
+	if !strings.Contains(result.Describe(), "a partition of app.events on the source and not a partition on the target") {
+		t.Fatalf("description:\n%s", result.Describe())
+	}
+}
+
+func TestPG17PrimaryKeyIsNotAPlainUniqueIndex(t *testing.T) {
+	p := start(t, 17)
+	// Same definition, but the target's index backs no constraint.
+	exec(t, p.source, "CREATE TABLE app.keys (id int NOT NULL); CREATE UNIQUE INDEX keys_pkey ON app.keys (id); ALTER TABLE app.keys ADD PRIMARY KEY USING INDEX keys_pkey")
+	exec(t, p.target, "CREATE TABLE app.keys (id int NOT NULL); CREATE UNIQUE INDEX keys_pkey ON app.keys (id)")
+	result := p.diff(t)
+	if got := strings.Join(indexNames(result), ","); got != "app.keys_pkey" {
+		t.Fatalf("missing indexes = %s\n%s", got, result.Describe())
+	}
+}
+
 func TestCrossMajorIdenticalSchemas(t *testing.T) {
 	majors := pgtest.Majors(t)
 	if len(majors) < 2 {
