@@ -2,7 +2,7 @@ module github.com/GetStream/pgmigrate
 
 go 1.25.0
 
-toolchain go1.25.13
+toolchain go1.26.10
 
 require (
 	github.com/jackc/pglogrepl v0.0.0-20260401131349-e37c41485510
@@ -79,7 +79,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.74.4 // indirect
